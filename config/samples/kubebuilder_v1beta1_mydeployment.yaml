@@ -1,0 +1,9 @@
+apiVersion: kubebuilder.zq.com/v1beta1
+kind: MyDeployment
+metadata:
+  labels:
+    app.kubernetes.io/name: mydeployment
+    app.kubernetes.io/managed-by: kustomize
+  name: mydeployment-sample
+spec:
+  # TODO(user): Add fields here
