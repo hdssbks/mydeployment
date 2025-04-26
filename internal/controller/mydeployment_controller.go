@@ -95,11 +95,11 @@ func (r *MyDeploymentReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		logger.Info(fmt.Sprintf("no pods found for MyDeployment: %s", mydeploy.Name))
 		return ctrl.Result{}, nil
 
-	// spec大于实际，删除pod
-	case diff > 0:
+	// spec小于实际，删除pod
+	case diff < 0:
 		r.Recorder.Event(mydeploy, corev1.EventTypeNormal, "Diff Pods", "more than spec, delete pods")
 		// delete pods
-		for i := 0; i < diff; i++ {
+		for i := 0; i < 0-diff; i++ {
 			logger.Info(fmt.Sprintf("deleting pod: %s", unTerminatedPods[i].Name))
 			if err := r.Delete(ctx, &unTerminatedPods[i]); err != nil {
 				r.Recorder.Event(mydeploy, corev1.EventTypeWarning, "DeletePod", err.Error())
@@ -108,11 +108,11 @@ func (r *MyDeploymentReconciler) Reconcile(ctx context.Context, req ctrl.Request
 			r.Recorder.Event(mydeploy, corev1.EventTypeNormal, "DeletePod", fmt.Sprintf("delete pod %s", unTerminatedPods[i].Name))
 		}
 
-	// spec小于实际，创建pod
+	// spec大于实际，创建pod
 	default:
 		r.Recorder.Event(mydeploy, corev1.EventTypeNormal, "Diff Pods", "less than spec, create pods")
 		// create pods
-		for i := 0; i < 0-diff; i++ {
+		for i := 0; i < diff; i++ {
 			pod := utils.NewPod(mydeploy)
 			if err := r.Create(ctx, pod); err != nil {
 				r.Recorder.Event(mydeploy, corev1.EventTypeWarning, "CreatePod", err.Error())
