@@ -12,13 +12,20 @@ import (
 )
 
 var funcMap = template.FuncMap{
-	"randAlphaNum": RandStr,
-	"lower":        strings.ToLower,
+	"randAlphaNum": func(n int) string {
+		const letters = "abcdefghijklmnopqrstuvwxyz0123456789"
+		result := make([]byte, n)
+		for i := range result {
+			result[i] = letters[i%len(letters)]
+		}
+		return string(result)
+	},
+	"lower": strings.ToLower,
 }
 
 func NewPod(deployment *v1beta1.MyDeployment) *corev1.Pod {
 	pod := &corev1.Pod{}
-	tpl, err := template.New("pod.tpl").Funcs(funcMap).ParseFiles("templates/pod.tpl")
+	tpl, err := template.New("pod").Funcs(funcMap).ParseFiles("templates/pod.tpl")
 	if err != nil {
 		log.Fatalln(fmt.Errorf("error parsing template: %v", err))
 	}
