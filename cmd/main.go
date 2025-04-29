@@ -90,9 +90,20 @@ func main() {
 		tlsOpts = append(tlsOpts, disableHTTP2)
 	}
 
-	webhookServer := webhook.NewServer(webhook.Options{
-		TLSOpts: tlsOpts,
-	})
+	webhookOptions := webhook.Options{TLSOpts: tlsOpts}
+	if os.Getenv("ENVIRONMENT") == "DEV" {
+		path, err := os.Getwd()
+		if err != nil {
+			setupLog.Error(err, "unable to get work dir")
+			os.Exit(1)
+		}
+		webhookOptions = webhook.Options{
+			TLSOpts: tlsOpts,
+			CertDir: path + "/certs",
+		}
+	}
+
+	webhookServer := webhook.NewServer(webhookOptions)
 
 	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
 		Scheme: scheme,
@@ -129,6 +140,12 @@ func main() {
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "MyDeployment")
 		os.Exit(1)
+	}
+	if os.Getenv("ENABLE_WEBHOOKS") != "false" {
+		if err = (&kubebuilderv1beta1.MyDeployment{}).SetupWebhookWithManager(mgr); err != nil {
+			setupLog.Error(err, "unable to create webhook", "webhook", "MyDeployment")
+			os.Exit(1)
+		}
 	}
 	//+kubebuilder:scaffold:builder
 
