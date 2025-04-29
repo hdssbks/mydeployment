@@ -12,15 +12,8 @@ import (
 )
 
 var funcMap = template.FuncMap{
-	"randAlphaNum": func(n int) string {
-		const letters = "abcdefghijklmnopqrstuvwxyz0123456789"
-		result := make([]byte, n)
-		for i := range result {
-			result[i] = letters[i%len(letters)]
-		}
-		return string(result)
-	},
-	"lower": strings.ToLower,
+	"randAlphaNum": RandStr,
+	"lower":        strings.ToLower,
 }
 
 func NewPod(deployment *v1beta1.MyDeployment) *corev1.Pod {
