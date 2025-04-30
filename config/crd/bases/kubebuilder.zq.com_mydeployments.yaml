@@ -11,6 +11,8 @@ spec:
     kind: MyDeployment
     listKind: MyDeploymentList
     plural: mydeployments
+    shortNames:
+    - md
     singular: mydeployment
   scope: Namespaced
   versions:
@@ -3564,4 +3566,7 @@ spec:
     served: true
     storage: true
     subresources:
+      scale:
+        specReplicasPath: .spec.replicas
+        statusReplicasPath: .status.replicas
       status: {}
