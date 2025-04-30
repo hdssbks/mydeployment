@@ -18,7 +18,7 @@ var funcMap = template.FuncMap{
 
 func NewPod(deployment *v1beta1.MyDeployment) *corev1.Pod {
 	pod := &corev1.Pod{}
-	tpl, err := template.New("pod").Funcs(funcMap).ParseFiles("templates/pod.tpl")
+	tpl, err := template.New("pod.tpl").Funcs(funcMap).ParseFiles("templates/pod.tpl")
 	if err != nil {
 		log.Fatalln(fmt.Errorf("error parsing template: %v", err))
 	}

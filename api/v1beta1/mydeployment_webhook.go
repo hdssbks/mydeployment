@@ -48,6 +48,9 @@ func (r *MyDeployment) Default() {
 	mydeploymentlog.Info("default", "name", r.Name)
 
 	// TODO(user): fill in your defaulting logic.
+	if r.Spec.Template.ObjectMeta.CreationTimestamp.IsZero() {
+		r.Spec.Template.ObjectMeta.CreationTimestamp = metav1.Now()
+	}
 	if r.Spec.Selector == nil {
 		r.Spec.Selector = &metav1.LabelSelector{
 			MatchLabels: r.Spec.Template.ObjectMeta.Labels,
@@ -77,10 +80,12 @@ func (r *MyDeployment) ValidateUpdate(old runtime.Object) (admission.Warnings, e
 }
 
 func (r *MyDeployment) validMyDeployment() error {
-	if r.Spec.Template.ObjectMeta.Labels == nil {
-		return apierrors.NewInvalid(r.GroupVersionKind().GroupKind(), r.Name, field.ErrorList{
-			field.Invalid(field.NewPath(r.Name), r.Spec.Template.ObjectMeta.Labels, ".spec.template.metadata.labels is required"),
-		})
+	for k, v := range r.Spec.Selector.MatchLabels {
+		if v1, ok := r.Spec.Template.ObjectMeta.Labels[k]; !ok || v1 != v {
+			return apierrors.NewInvalid(r.GroupVersionKind().GroupKind(), r.Name, field.ErrorList{
+				field.Invalid(field.NewPath(".spec.template.metadata.labels"), r.Spec.Template.ObjectMeta.Labels, ".spec.template.metadata.labels must equal with .spec.selector.matchlabels"),
+			})
+		}
 	}
 	return nil
 }
