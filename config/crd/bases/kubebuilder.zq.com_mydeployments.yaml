@@ -16,7 +16,19 @@ spec:
     singular: mydeployment
   scope: Namespaced
   versions:
-  - name: v1beta1
+  - additionalPrinterColumns:
+    - description: ReadyReplicas
+      jsonPath: .status.readyReplicas
+      name: available
+      type: integer
+    - description: Expected Replicas
+      jsonPath: .spec.replicas
+      name: expected
+      type: integer
+    - jsonPath: .metadata.creationTimestamp
+      name: age
+      type: date
+    name: v1beta1
     schema:
       openAPIV3Schema:
         properties:

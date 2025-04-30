@@ -298,6 +298,9 @@ type MyDeploymentStatus struct {
 //+kubebuilder:subresource:status
 //+kubebuilder:resource:scope=Namespaced,shortName=md
 //+kubebuilder:subresource:scale:specpath=.spec.replicas,statuspath=.status.replicas
+//+kubebuilder:printcolumn:name="available",type="integer",JSONPath=".status.readyReplicas",description="ReadyReplicas"
+//+kubebuilder:printcolumn:name="expected",type="integer",JSONPath=".spec.replicas",description="Expected Replicas"
+//+kubebuilder:printcolumn:name="age",type="date",JSONPath=".metadata.creationTimestamp"
 
 // MyDeployment is the Schema for the mydeployments API
 type MyDeployment struct {
