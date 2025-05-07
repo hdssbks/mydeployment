@@ -585,8 +585,43 @@ default:
 }
 return ctrl.Result{}, nil
 ```
+7. 更新状态的方法
+```go
+func (r *MyDeploymentReconciler) updateStatus(ctx context.Context, deploy *kubebuilderv1beta1.MyDeployment, listOpts *client.ListOptions, cr *appsv1.ControllerRevision) error {
+    logger := log.FromContext(ctx)
 
-## 注意事项
+    // 以matchLables查找mydeploy关联的pod
+    pods := &corev1.PodList{}
+    if err := r.List(ctx, pods, listOpts); err != nil {
+        logger.Error(err, "can not list pods")
+        return err
+    }
+
+// 在podlist中查找状态为ready的pod
+    readyPods := int32(0)
+    for _, pod := range pods.Items {
+        for _, c := range pod.Status.Conditions {
+            if c.Type == corev1.PodReady && c.Status == corev1.ConditionTrue {
+                readyPods++
+            }
+        }
+    }
+
+    deploy.Status.CurrentReplicas = int32(len(pods.Items))
+    deploy.Status.Replicas = *deploy.Spec.Replicas
+    deploy.Status.AvailableReplicas = readyPods
+    deploy.Status.ReadyReplicas = readyPods
+    deploy.Status.CurrentRevision = cr.Name
+
+    if err := r.Status().Update(ctx, deploy); err != nil {
+        //r.Recorder.Event(deploy, corev1.EventTypeWarning, "Status Update", err.Error())
+        return err
+    }
+    return nil
+}
+```
+
+### 注意事项
 1. 在更新MyDeployment的状态时，会触发更新事件，从而再次调谐，由于goroutine的关系，可能会导致resourceVersion过期，报错如下
 ```shell
 Operation cannot be fulfilled on [Resource Kind\Resource Name]: the object has been modified; please apply your changes to the latest version and try again
@@ -640,3 +675,358 @@ func (r *MyDeploymentReconciler) getMaxRevision(ctx context.Context, mydeploy *k
 }
 ```
 导致我每次取出的maxRevision都不一样。这是一个初学者常见的循环变量问题，在golang中cr作为循环变量，它的地址始终不变，变的是地址中的值，而非每次循环都会为cr分配新的地址，所以循环结束时&cr始终指向最后一次循环的值。网上的资料表示，这个问题在golang 1.22后解决，我并未验证，在后续的开发应尽量避免取循环变量的地址
+
+### Webhook
+这里我们的需求是，MyDeployment.Spec.Selector必须与MyDeployment.Spec.Template.Metadata.Labels相同，如果不同则报错
+1. 创建一个validating webhook
+```shell
+$ kubebuilder create webhook --group kubebuilder --version v1beta1 --kind MyDeployment --programmatic-validation
+```
+2. 校验逻辑，循环MyDeployment.Spec.Selector.MatchLabels，如果MyDeployment.Spec.Template.ObjectMeta.Labels没有Key，或者Key对应的Value和Selector的不一致，则报错
+```go
+func (r *MyDeployment) validMyDeployment() error {
+	for k, v := range r.Spec.Selector.MatchLabels {
+		if v1, ok := r.Spec.Template.ObjectMeta.Labels[k]; !ok || v1 != v {
+			return apierrors.NewInvalid(r.GroupVersionKind().GroupKind(), r.Name, field.ErrorList{
+				field.Invalid(field.NewPath(".spec.template.metadata.labels"), r.Spec.Template.ObjectMeta.Labels, ".spec.template.metadata.labels must equal with .spec.selector.matchlabels"),
+			})
+		}
+	}
+	return nil
+}
+```
+3. 在create和update时调用
+```go
+// ValidateCreate implements webhook.Validator so a webhook will be registered for the type
+func (r *MyDeployment) ValidateCreate() (admission.Warnings, error) {
+	mydeploymentlog.Info("validate create", "name", r.Name)
+
+	// TODO(user): fill in your validation logic upon object creation.
+	return nil, r.validMyDeployment()
+}
+
+// ValidateUpdate implements webhook.Validator so a webhook will be registered for the type
+func (r *MyDeployment) ValidateUpdate(old runtime.Object) (admission.Warnings, error) {
+	mydeploymentlog.Info("validate update", "name", r.Name)
+
+	// TODO(user): fill in your validation logic upon object update.
+	return nil, r.validMyDeployment()
+}
+```
+4. 打开config/default/kustomization.yaml中关于Webhook的配置
+```yaml
+# Adds namespace to all resources.
+namespace: mydeployment-system
+
+# Value of this field is prepended to the
+# names of all resources, e.g. a deployment named
+# "wordpress" becomes "alices-wordpress".
+# Note that it should also match with the prefix (text before '-') of the namespace
+# field above.
+namePrefix: mydeployment-
+
+# Labels to add to all resources and selectors.
+#labels:
+#- includeSelectors: true
+#  pairs:
+#    someName: someValue
+
+resources:
+  - ../crd
+  - ../rbac
+  - ../manager
+  # [WEBHOOK] To enable webhook, uncomment all the sections with [WEBHOOK] prefix including the one in
+  # crd/kustomization.yaml
+  - ../webhook
+  # [CERTMANAGER] To enable cert-manager, uncomment all sections with 'CERTMANAGER'. 'WEBHOOK' components are required.
+  - ../certmanager
+# [PROMETHEUS] To enable prometheus monitor, uncomment all sections with 'PROMETHEUS'.
+#- ../prometheus
+
+patches:
+  # Protect the /metrics endpoint by putting it behind auth.
+  # If you want your controller-manager to expose the /metrics
+  # endpoint w/o any authn/z, please comment the following line.
+  - path: manager_auth_proxy_patch.yaml
+
+  # [WEBHOOK] To enable webhook, uncomment all the sections with [WEBHOOK] prefix including the one in
+  # crd/kustomization.yaml
+  - path: manager_webhook_patch.yaml
+
+  # [CERTMANAGER] To enable cert-manager, uncomment all sections with 'CERTMANAGER'.
+  # Uncomment 'CERTMANAGER' sections in crd/kustomization.yaml to enable the CA injection in the admission webhooks.
+  # 'CERTMANAGER' needs to be enabled to use ca injection
+  - path: webhookcainjection_patch.yaml
+
+# [CERTMANAGER] To enable cert-manager, uncomment all sections with 'CERTMANAGER' prefix.
+# Uncomment the following replacements to add the cert-manager CA injection annotations
+replacements:
+  - source: # Add cert-manager annotation to ValidatingWebhookConfiguration, MutatingWebhookConfiguration and CRDs
+      kind: Certificate
+      group: cert-manager.io
+      version: v1
+      name: serving-cert # this name should match the one in certificate.yaml
+      fieldPath: .metadata.namespace # namespace of the certificate CR
+    targets:
+      - select:
+          kind: ValidatingWebhookConfiguration
+        fieldPaths:
+          - .metadata.annotations.[cert-manager.io/inject-ca-from]
+        options:
+          delimiter: '/'
+          index: 0
+          create: true
+      - select:
+          kind: MutatingWebhookConfiguration
+        fieldPaths:
+          - .metadata.annotations.[cert-manager.io/inject-ca-from]
+        options:
+          delimiter: '/'
+          index: 0
+          create: true
+      - select:
+          kind: CustomResourceDefinition
+        fieldPaths:
+          - .metadata.annotations.[cert-manager.io/inject-ca-from]
+        options:
+          delimiter: '/'
+          index: 0
+          create: true
+  - source:
+      kind: Certificate
+      group: cert-manager.io
+      version: v1
+      name: serving-cert # this name should match the one in certificate.yaml
+      fieldPath: .metadata.name
+    targets:
+      - select:
+          kind: ValidatingWebhookConfiguration
+        fieldPaths:
+          - .metadata.annotations.[cert-manager.io/inject-ca-from]
+        options:
+          delimiter: '/'
+          index: 1
+          create: true
+      - select:
+          kind: MutatingWebhookConfiguration
+        fieldPaths:
+          - .metadata.annotations.[cert-manager.io/inject-ca-from]
+        options:
+          delimiter: '/'
+          index: 1
+          create: true
+      - select:
+          kind: CustomResourceDefinition
+        fieldPaths:
+          - .metadata.annotations.[cert-manager.io/inject-ca-from]
+        options:
+          delimiter: '/'
+          index: 1
+          create: true
+  - source: # Add cert-manager annotation to the webhook Service
+      kind: Service
+      version: v1
+      name: webhook-service
+      fieldPath: .metadata.name # namespace of the service
+    targets:
+      - select:
+          kind: Certificate
+          group: cert-manager.io
+          version: v1
+        fieldPaths:
+          - .spec.dnsNames.0
+          - .spec.dnsNames.1
+        options:
+          delimiter: '.'
+          index: 0
+          create: true
+  - source:
+      kind: Service
+      version: v1
+      name: webhook-service
+      fieldPath: .metadata.namespace # namespace of the service
+    targets:
+      - select:
+          kind: Certificate
+          group: cert-manager.io
+          version: v1
+        fieldPaths:
+          - .spec.dnsNames.0
+          - .spec.dnsNames.1
+        options:
+          delimiter: '.'
+          index: 1
+          create: true
+```
+5. 更新manifests
+```shell
+$ make manifests
+```
+6. 安装cert-manager，注意k8s版本的兼容
+```shell
+kubectl apply -f https://github.com/cert-manager/cert-manager/releases/download/v1.12.13/cert-manager.yaml
+```
+7. 修改Dockerfile
+```dockerfile
+# Build the manager binary
+FROM golang:1.22.12 AS builder
+ARG TARGETOS
+ARG TARGETARCH
+
+WORKDIR /workspace
+# Copy the Go Modules manifests
+COPY go.mod go.mod
+COPY go.sum go.sum
+# cache deps before building and copying source so that we don't need to re-download as much
+# and so that source changes don't invalidate our downloaded layer
+RUN go mod download
+
+# Copy the go source
+COPY cmd/main.go cmd/main.go
+COPY api/ api/
+COPY internal/controller/ internal/controller/
+COPY templates/ templates/
+COPY utils/ utils/
+
+# Build
+# the GOARCH has not a default value to allow the binary be built according to the host where the command
+# was called. For example, if we call make docker-build in a local env which has the Apple Silicon M1 SO
+# the docker BUILDPLATFORM arg will be linux/arm64 when for Apple x86 it will be linux/amd64. Therefore,
+# by leaving it empty we can ensure that the container and binary shipped on it will have the same platform.
+RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} go build -a -o manager cmd/main.go
+
+# Use distroless as minimal base image to package the manager binary
+# Refer to https://github.com/GoogleContainerTools/distroless for more details
+FROM alpine:3.15.3
+WORKDIR /
+COPY --from=builder --chown=65532:65532 /workspace/manager .
+COPY --from=builder --chown=65532:65532 /workspace/templates/ templates/
+USER 65532:65532
+
+ENTRYPOINT ["/manager"]
+```
+8. 构建镜像
+```shell
+$ docker build --build-arg HTTPS_PROXY="http://10.4.7.254:7890" --build-arg HTTP_PROXY="http://10.4.7.254:7890" -t hdss7-222.zq.com/clientgo-demo/mydeployment:v1.0.0 .
+```
+9. 上传镜像
+```shell
+$ docker push hdss7-222.zq.com/clientgo-demo/mydeployment:v1.0.0
+```
+10. 部署镜像
+```shell
+$ IMG=hdss7-222.zq.com/clientgo-demo/mydeployment:v1.0.0 make deploy
+```
+11. 验证
+```shell
+$ cat config/samples/kubebuilder_v1beta1_mydeployment.yaml
+apiVersion: kubebuilder.zq.com/v1beta1
+kind: MyDeployment
+metadata:
+  labels:
+    app.kubernetes.io/name: mydeployment
+    app.kubernetes.io/managed-by: kustomize
+  name: mydeployment-sample
+  namespace: default
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mydeplo
+  template:
+    metadata:
+      labels:
+        app: mydeploy
+    spec:
+      containers:
+        - image: nginx:v1.13
+          name: nginx
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 80
+
+$  kubectl apply -f config/samples/kubebuilder_v1beta1_mydeployment.yaml
+The MyDeployment "mydeployment-sample" is invalid: .spec.template.metadata.labels: Invalid value: map[string]string{"app":"mydeploy"}: .spec.template.metadata.labels must equal with .spec.selector.matchlabels
+```
+
+### 其他优化
+1. 使MyDeployment支持kubectl scale命令修改副本数，在api/v1beta1/mydeployment_types.go中添加注释
+```go
+//+kubebuilder:object:root=true
+//+kubebuilder:subresource:status
+//+kubebuilder:subresource:scale:specpath=.spec.replicas,statuspath=.status.replicas
+
+// MyDeployment is the Schema for the mydeployments API
+type MyDeployment struct {
+	metav1.TypeMeta   `json:",inline"`
+	metav1.ObjectMeta `json:"metadata,omitempty"`
+
+	Spec   MyDeploymentSpec   `json:"spec,omitempty"`
+	Status MyDeploymentStatus `json:"status,omitempty"`
+}
+```
+更新manifests
+```shell
+$ make manifests
+```
+验证
+```shell
+$ kubectl scale mydeployment mydeployment-sample --replicas=2
+mydeployment.kubebuilder.zq.com/mydeployment-sample scaled
+```
+2. 为MyDeployment添加缩写md，在api/v1beta1/mydeployment_types.go中添加注释
+```go
+//+kubebuilder:object:root=true
+//+kubebuilder:subresource:status
+//+kubebuilder:resource:scope=Namespaced,shortName=md
+//+kubebuilder:subresource:scale:specpath=.spec.replicas,statuspath=.status.replicas
+
+
+// MyDeployment is the Schema for the mydeployments API
+type MyDeployment struct {
+	metav1.TypeMeta   `json:",inline"`
+	metav1.ObjectMeta `json:"metadata,omitempty"`
+
+	Spec   MyDeploymentSpec   `json:"spec,omitempty"`
+	Status MyDeploymentStatus `json:"status,omitempty"`
+}
+```
+更新manifests
+```shell
+$ make manifests
+```
+验证
+```shell
+$ # kubectl get md
+NAME
+mydeployment-sample
+```
+3. kubectl get md时显示更多信息，在api/v1beta1/mydeployment_types.go中添加注释
+```go
+//+kubebuilder:object:root=true
+//+kubebuilder:subresource:status
+//+kubebuilder:resource:scope=Namespaced,shortName=md
+//+kubebuilder:subresource:scale:specpath=.spec.replicas,statuspath=.status.replicas
+//+kubebuilder:printcolumn:name="available",type="integer",JSONPath=".status.readyReplicas",description="ReadyReplicas"
+//+kubebuilder:printcolumn:name="expected",type="integer",JSONPath=".spec.replicas",description="Expected Replicas"
+//+kubebuilder:printcolumn:name="age",type="date",JSONPath=".metadata.creationTimestamp"
+
+// MyDeployment is the Schema for the mydeployments API
+type MyDeployment struct {
+	metav1.TypeMeta   `json:",inline"`
+	metav1.ObjectMeta `json:"metadata,omitempty"`
+
+	Spec   MyDeploymentSpec   `json:"spec,omitempty"`
+	Status MyDeploymentStatus `json:"status,omitempty"`
+}
+```
+更新manifests
+```shell
+$ make manifests
+```
+验证
+```shell
+# kubectl get md
+NAME                  AVAILABLE   EXPECTED   AGE
+mydeployment-sample   2           2          28h
+```
