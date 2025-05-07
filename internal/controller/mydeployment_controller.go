@@ -24,11 +24,10 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/labels"
-	"k8s.io/client-go/tools/record"
-	"reflect"
-
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/json"
+	"k8s.io/client-go/tools/record"
+	"reflect"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
@@ -293,5 +292,6 @@ func (r *MyDeploymentReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		For(&kubebuilderv1beta1.MyDeployment{}).
 		Owns(&corev1.Pod{}).
 		Owns(&appsv1.ControllerRevision{}).
+		//		WithEventFilter(predicate.GenerationChangedPredicate{}).
 		Complete(r)
 }

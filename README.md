@@ -359,3 +359,281 @@ VERSION:  kubebuilder.zq.com/v1beta1
 DESCRIPTION:
      <empty>
 ```
+执行make generate生成DeepCopy方法
+```shell
+root@minikube:/home/mydeployment# make generate
+/home/mydeployment/bin/controller-gen-v0.14.0 object:headerFile="hack/boilerplate.go.txt" paths="./..."
+```
+
+### 调谐逻辑
+![](png/Reconcile.png "Reconcile")
+1. 从缓存中获取MyDeployment，如果err为IsNotFound，表示删除事件，直接返回
+2. 如果能获取MyDeployment，从ControllerRevision中获取最大的revision
+3. 如果maxRevisionCR为空，表示资源尚未创建ControllerRevision，则创建ControllerRevision，且RevisionID为1
+4. 如果maxRevisionCR不为空，则从maxRevisionCR取出object, 比较object.Spec.Template.Spec与从缓存中获取的MyDeployment.Spec.Template.Spec，比较的目的为判断镜像是否改变，副本数的变化不在判断中
+5. 如果不相同，则创建新的ControllerRevision，并且RevisionID+1，同时通过Label从缓存中找到MyDeployment管理的PodList，并通过循环PodList.item删除Pod
+6. 从循环PodList.Item，找到状态不为Terminating的Pod，比较状态不为Terminating的Pod的数量和MyDeployment.Spec.Replicas
+7. 如果不为Terminating的Pod的数量大于MyDeployment.Spec.Replicas，则删除多余的Pod
+8. 如果不为Terminating的Pod的数量小于MyDeployment.Spec.Replicas，则创建Pod
+9. 如果不为Terminating的Pod的数量等于MyDeployment.Spec.Replicas，则更新状态
+
+### 代码实现
+1. 从缓存中获取MyDeployment，如果err为IsNotFound，表示删除事件，直接返回
+```go
+mydeploy := &kubebuilderv1beta1.MyDeployment{}
+if err := r.Get(ctx, req.NamespacedName, mydeploy); err != nil {
+    return ctrl.Result{}, client.IgnoreNotFound(err)
+}
+
+// 如果deployment暂停，就不会创建删除pod，直接返回
+if mydeploy.Spec.Paused {
+    return ctrl.Result{}, nil
+}
+```
+
+2. 如果能获取MyDeployment，从ControllerRevision中获取最大的revision
+```go
+cr, err := r.getMaxRevision(ctx, mydeploy, listOpts)
+if err != nil {
+	r.Recorder.Event(mydeploy, corev1.EventTypeWarning, "GetControllerRevision", err.Error())
+	return ctrl.Result{}, err
+}
+
+// 获取最大的Revision
+func (r *MyDeploymentReconciler) getMaxRevision(ctx context.Context, mydeploy *kubebuilderv1beta1.MyDeployment, listOpts client.ListOptions) (*appsv1.ControllerRevision, error) {
+	crs := &appsv1.ControllerRevisionList{}
+	if err := r.List(ctx, crs, &listOpts); err != nil {
+		r.Recorder.Event(mydeploy, corev1.EventTypeWarning, "ListControllerRevision", err.Error())
+		return nil, err
+	}
+	if len(crs.Items) == 0 {
+		return nil, nil
+	}
+	maxRevision := int64(0)
+	index := 0
+	for i, cr := range crs.Items {
+		if cr.Revision > maxRevision {
+			maxRevision = cr.Revision
+			index = i
+		}
+	}
+	return &crs.Items[index], nil
+}
+```
+3. 如果maxRevisionCR为空，表示资源尚未创建ControllerRevision，则创建ControllerRevision，且RevisionID为1
+```go
+// 如果cr为空，则创建cr
+if cr == nil {
+    cr, err = r.createControllerRevision(ctx, mydeploy, 1)
+    if err != nil {
+        r.Recorder.Event(mydeploy, corev1.EventTypeWarning, "CreateControllerRevision", err.Error())
+        return ctrl.Result{}, err
+    }
+}
+
+// 创建cr
+func (r *MyDeploymentReconciler) createControllerRevision(ctx context.Context, mydeploy *kubebuilderv1beta1.MyDeployment, revision int64) (*appsv1.ControllerRevision, error) {
+    // 将MyDeployment对象序列化为json
+    bytesDeploy, err := json.Marshal(mydeploy)
+    if err != nil {
+        r.Recorder.Event(mydeploy, corev1.EventTypeWarning, "Unmarshal", err.Error())
+        panic(err)
+    }
+
+	cr := &appsv1.ControllerRevision{
+        ObjectMeta: ctrl.ObjectMeta{
+            Namespace: mydeploy.Namespace,
+            Name:      mydeploy.Name + "-" + utils.RandStr(5),
+            Labels:    mydeploy.Spec.Selector.MatchLabels,
+        },
+        Data: runtime.RawExtension{
+            Raw:    bytesDeploy,
+            Object: mydeploy,
+        },
+        Revision: revision,
+    }
+
+	// 设置cr的OwnerReference为MyDeployment
+    if err := ctrl.SetControllerReference(mydeploy, cr, r.Scheme); err != nil {
+        r.Recorder.Event(mydeploy, corev1.EventTypeWarning, "SetControllerReference", err.Error())
+        return nil, err
+    }
+	
+    if err := r.Create(ctx, cr); err != nil {
+        r.Recorder.Event(mydeploy, corev1.EventTypeWarning, "CreateControllerRevision", err.Error())
+        return nil, err
+    }
+	
+    return cr, nil
+}
+```
+4. 如果maxRevisionCR不为空，则从maxRevisionCR取出object，判断镜像是否改变，如果改变则创建新的CR，并删除所有Pod
+```go
+// 通过标签找到被MyDeployment管理的pod
+pods := &corev1.PodList{}
+err = r.List(ctx, pods, &listOpts)
+if err != nil {
+    r.Recorder.Event(mydeploy, corev1.EventTypeWarning, "GetPods", err.Error())
+    return ctrl.Result{}, err
+}
+
+// 如果cr不为空，获取cr中的object
+obj := &kubebuilderv1beta1.MyDeployment{}
+if err := json.Unmarshal(cr.Data.Raw, obj); err != nil {
+    r.Recorder.Event(mydeploy, corev1.EventTypeWarning, "Unmarshal", err.Error())
+    return ctrl.Result{}, err
+}
+// 比较object.Spec.Template.Spec和MyDeployment.Spec.Template.Spec，如果不相同，则创建新的cr，并删除所有pod
+if !reflect.DeepEqual(obj.Spec.Template.Spec, mydeploy.Spec.Template.Spec) {
+	// 创建cr,且revision+1
+    if _, err := r.createControllerRevision(ctx, mydeploy, cr.Revision+1); err != nil {
+        r.Recorder.Event(mydeploy, corev1.EventTypeWarning, "CreateControllerRevision", err.Error())
+        return ctrl.Result{}, err
+    }
+	// 删除pod
+    for _, pod := range pods.Items {
+        if err := r.Delete(ctx, &pod); err != nil {
+            r.Recorder.Event(&pod, corev1.EventTypeWarning, "Delete Pod", "Delete Pod Failed")
+        }
+    }
+	// 更新状态
+    if err := r.updateStatus(ctx, mydeploy, &listOpts, cr); err != nil {
+        if apierrors.IsConflict(err) {
+            r.Recorder.Event(mydeploy, corev1.EventTypeNormal, "Conflict Requeue", err.Error())
+            return ctrl.Result{Requeue: true}, nil
+        } else {
+            r.Recorder.Event(mydeploy, corev1.EventTypeWarning, "UpdateStatus", err.Error())
+            return ctrl.Result{}, err
+        }
+    }
+}
+```
+5. 从循环PodList.Item，找到状态不为Terminating的Pod，比较状态不为Terminating的Pod的数量和MyDeployment.Spec.Replicas
+```go
+// 删除中的Pod不参与计算
+unTerminatedPods := make([]corev1.Pod, 0, len(pods.Items))
+for _, pod := range pods.Items {
+    if pod.ObjectMeta.DeletionTimestamp.IsZero() {
+        unTerminatedPods = append(unTerminatedPods, pod)
+    }
+}
+
+// 比较mydeploy.Spec.Replicas和unTerminatedPods中的数量
+diff := int(*mydeploy.Spec.Replicas) - len(unTerminatedPods)
+```
+6. 根据数量的差异，创建/删除Pod
+```go
+switch {
+// spec等于实际，直接返回
+case diff == 0:
+    if err := r.updateStatus(ctx, mydeploy, &listOpts, cr); err != nil {
+        if apierrors.IsConflict(err) {
+            r.Recorder.Event(mydeploy, corev1.EventTypeNormal, "Conflict Requeue", err.Error())
+            return ctrl.Result{Requeue: true}, nil
+        } else {
+            r.Recorder.Event(mydeploy, corev1.EventTypeWarning, "UpdateStatus", err.Error())
+            return ctrl.Result{}, err
+        }
+    }
+// spec小于实际，删除pod
+case diff < 0:
+    r.Recorder.Event(mydeploy, corev1.EventTypeNormal, "Diff Pods", "more than spec, delete pods")
+    // delete pods
+    for i := 0; i < 0-diff; i++ {
+        logger.Info(fmt.Sprintf("deleting pod: %s", unTerminatedPods[i].Name))
+        if err := r.Delete(ctx, &unTerminatedPods[i]); err != nil {
+            r.Recorder.Event(mydeploy, corev1.EventTypeWarning, "DeletePod", err.Error())
+            return ctrl.Result{}, err
+        }
+        r.Recorder.Event(mydeploy, corev1.EventTypeNormal, "DeletePod", fmt.Sprintf("delete pod %s", unTerminatedPods[i].Name))
+    }
+    if err := r.updateStatus(ctx, mydeploy, &listOpts, cr); err != nil {
+        if apierrors.IsConflict(err) {
+            r.Recorder.Event(mydeploy, corev1.EventTypeNormal, "Conflict Requeue", err.Error())
+            return ctrl.Result{Requeue: true}, nil
+        } else {
+            r.Recorder.Event(mydeploy, corev1.EventTypeWarning, "UpdateStatus", err.Error())
+            return ctrl.Result{}, err
+        }
+    }
+
+// spec大于实际，创建pod
+default:
+    r.Recorder.Event(mydeploy, corev1.EventTypeNormal, "Diff Pods", "less than spec, create pods")
+    // create pods
+    for i := 0; i < diff; i++ {
+        pod := utils.NewPod(mydeploy)
+        err := ctrl.SetControllerReference(mydeploy, pod, r.Scheme)
+        if err != nil {
+            r.Recorder.Event(mydeploy, corev1.EventTypeWarning, "SetControllerReference", err.Error())
+            return ctrl.Result{}, err
+        }
+        if err := r.Create(ctx, pod); err != nil {
+            r.Recorder.Event(mydeploy, corev1.EventTypeWarning, "CreatePod", err.Error())
+            return ctrl.Result{}, err
+        }
+    }
+    if err := r.updateStatus(ctx, mydeploy, &listOpts, cr); err != nil {
+        if apierrors.IsConflict(err) {
+            r.Recorder.Event(mydeploy, corev1.EventTypeNormal, "Conflict Requeue", err.Error())
+            return ctrl.Result{Requeue: true}, nil
+        } else {
+            r.Recorder.Event(mydeploy, corev1.EventTypeWarning, "UpdateStatus", err.Error())
+            return ctrl.Result{}, err
+        }
+    }
+}
+return ctrl.Result{}, nil
+```
+
+## 注意事项
+1. 在更新MyDeployment的状态时，会触发更新事件，从而再次调谐，由于goroutine的关系，可能会导致resourceVersion过期，报错如下
+```shell
+Operation cannot be fulfilled on [Resource Kind\Resource Name]: the object has been modified; please apply your changes to the latest version and try again
+```
+目前我已知的解决方法有两个
+1. 在SetupWithManager中添加Predicate，不将非Spec更新的事件加入到WorkQueue
+```go
+func (r *MyDeploymentReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	return ctrl.NewControllerManagedBy(mgr).
+		For(&kubebuilderv1beta1.MyDeployment{}).
+		Owns(&corev1.Pod{}).
+		Owns(&appsv1.ControllerRevision{}).
+		WithEventFilter(predicate.GenerationChangedPredicate{}).
+		Complete(r)
+}
+```
+2. 在UpdateStatus报错时，将object重新入队，ElasticSearch的Operator也采取了相同的做法，参考https://zhuanlan.zhihu.com/p/402061389
+```go
+if err := r.updateStatus(ctx, mydeploy, &listOpts, cr); err != nil {
+    if apierrors.IsConflict(err) {
+        r.Recorder.Event(mydeploy, corev1.EventTypeNormal, "Conflict Requeue", err.Error())
+        return ctrl.Result{Requeue: true}, nil
+    } else {
+        r.Recorder.Event(mydeploy, corev1.EventTypeWarning, "UpdateStatus", err.Error())
+        return ctrl.Result{}, err
+    }
+}
+```
+2. 在获取maxRevisionCR时，我最初的写法为
+```go
+func (r *MyDeploymentReconciler) getMaxRevision(ctx context.Context, mydeploy *kubebuilderv1beta1.MyDeployment, listOpts client.ListOptions) (*appsv1.ControllerRevision, error) {
+	crs := &appsv1.ControllerRevisionList{}
+	if err := r.List(ctx, crs, &listOpts); err != nil {
+		r.Recorder.Event(mydeploy, corev1.EventTypeWarning, "ListControllerRevision", err.Error())
+		return nil, err
+	}
+	if len(crs.Items) == 0 {
+		return nil, nil
+	}
+	maxRevisionCR := &appsv1.ControllerRevision{}
+	maxRevision := 0
+	for i, cr := range crs.Items {
+		if cr.Revision > maxRevision {
+			maxRevisionCR = &cr
+		}
+	}
+	return maxRevisionCR, nil
+}
+```
+导致我每次取出的maxRevision都不一样。这是一个初学者常见的循环变量问题，在golang中cr作为循环变量，它的地址始终不变，变的是地址中的值，而非每次循环都会为cr分配新的地址，所以循环结束时&cr始终指向最后一次循环的值。网上的资料表示，这个问题在golang 1.22后解决，我并未验证，在后续的开发应尽量避免取循环变量的地址
