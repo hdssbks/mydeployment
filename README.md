@@ -592,7 +592,9 @@ return ctrl.Result{}, nil
 Operation cannot be fulfilled on [Resource Kind\Resource Name]: the object has been modified; please apply your changes to the latest version and try again
 ```
 目前我已知的解决方法有两个
-1. 在SetupWithManager中添加Predicate，不将非Spec更新的事件加入到WorkQueue
+
+- 在SetupWithManager中添加Predicate，不将非Spec更新的事件加入到WorkQueue
+
 ```go
 func (r *MyDeploymentReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
@@ -603,7 +605,8 @@ func (r *MyDeploymentReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Complete(r)
 }
 ```
-2. 在UpdateStatus报错时，将object重新入队，ElasticSearch的Operator也采取了相同的做法，参考https://zhuanlan.zhihu.com/p/402061389
+- 在UpdateStatus报错时，将object重新入队，ElasticSearch的Operator也采取了相同的做法，参考https://zhuanlan.zhihu.com/p/402061389
+
 ```go
 if err := r.updateStatus(ctx, mydeploy, &listOpts, cr); err != nil {
     if apierrors.IsConflict(err) {
